@@ -1,22 +1,20 @@
+from datetime import date, datetime
+from collections import Counter
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from sqlmodel import SQLModel, Session, select
-from collections import Counter
+from slowapi import _rate_limit_exceeded_handler
+from slowapi.errors import RateLimitExceeded
+
 from models import engine, Product, Review, Order, OrderItem, Coupon
+from auth import limiter
 
 SQLModel.metadata.create_all(engine)
 
-# add payment_method column if it doesn't exist yet (safe one-time migration)
-from sqlalchemy import text
-with Session(engine) as _s:
-    try:
-        _s.exec(text("ALTER TABLE orders ADD COLUMN payment_method TEXT DEFAULT 'cod'"))
-        _s.commit()
-    except Exception:
-        pass
-
 app = FastAPI(title="AURA Perfume API")
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 from admin import router as admin_router
 app.include_router(admin_router)
@@ -26,180 +24,196 @@ app.add_middleware(
     allow_origins=[
         "http://localhost:5174",
         "http://127.0.0.1:5174",
-        "http://localhost:5173",   # clothing shop dev fallback
+        "http://localhost:5173",
         "http://localhost:5175",
     ],
     allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
     allow_headers=["Content-Type", "Authorization"],
 )
 
-# ── Taxonomy definition ───────────────────────────────────────────────────────
-TAXONOMY: dict[str, dict[str, list[str]]] = {
-    "Men": {
-        "Tops":                  ["T-Shirts", "Polos", "Shirts", "Tank Tops", "Long Sleeves"],
-        "Hoodies & Sweatshirts": ["Pullover", "Zip Hoodie", "Crewneck", "Oversized"],
-        "Knitwear":              ["Sweaters", "Cardigans", "Turtlenecks"],
-        "Outerwear":             ["Bomber", "Denim Jacket", "Puffer", "Leather Jacket", "Windbreaker", "Trench"],
-        "Bottoms":               ["Jeans", "Cargo Pants", "Joggers", "Chinos", "Shorts"],
-        "Activewear":            ["Track Pants", "Training Tees"],
-        "Footwear":              ["Sneakers", "Boots", "Loafers", "Slides"],
-        "Accessories":           ["Caps", "Beanies", "Bags & Backpacks", "Belts", "Sunglasses", "Socks"],
-    },
-    "Women": {
-        "Tops":                  ["T-Shirts", "Crop Tops", "Shirts", "Tank Tops", "Long Sleeves"],
-        "Hoodies & Sweatshirts": ["Pullover", "Zip Hoodie", "Crewneck", "Oversized"],
-        "Knitwear":              ["Sweaters", "Cardigans", "Turtlenecks"],
-        "Outerwear":             ["Bomber", "Puffer", "Leather Jacket", "Windbreaker", "Trench", "Wool Coat", "Blazer"],
-        "Bottoms":               ["Jeans", "Cargo Pants", "Joggers", "Shorts", "Skirts"],
-        "Dresses":               ["Mini", "Midi", "Maxi"],
-        "Activewear":            ["Leggings", "Sports Bras", "Track Pants", "Training Tees"],
-        "Loungewear":            ["Loungewear Sets"],
-        "Footwear":              ["Sneakers", "Boots", "Sandals", "Slides", "Loafers"],
-        "Accessories":           ["Caps", "Beanies", "Bags & Backpacks", "Belts", "Sunglasses", "Socks", "Scarves", "Watches"],
-    },
-    "Kids": {
-        "Tops":                  ["T-Shirts", "Long Sleeves"],
-        "Hoodies & Sweatshirts": ["Pullover", "Zip Hoodie"],
-        "Outerwear":             ["Puffer", "Windbreaker"],
-        "Bottoms":               ["Jeans", "Joggers", "Shorts"],
-        "Footwear":              ["Sneakers", "Boots"],
-        "Accessories":           ["Caps", "Beanies", "Socks"],
-    },
+# ── Perfume taxonomy ──────────────────────────────────────────────────────────
+GENDERS = ["Women", "Men", "Unisex"]
+
+FAMILIES = [
+    "Floral", "Woody", "Oriental/Amber", "Fresh/Aquatic",
+    "Citrus", "Gourmand", "Aromatic", "Leather", "Musk",
+]
+
+CONCENTRATIONS = ["Parfum", "Eau de Parfum", "Eau de Toilette", "Eau de Cologne"]
+
+# Full taxonomy: gender → family → concentrations available
+_FAMILY_CONCS: dict[str, list[str]] = {
+    "Floral":          ["Parfum", "Eau de Parfum", "Eau de Toilette", "Eau de Cologne"],
+    "Woody":           ["Parfum", "Eau de Parfum", "Eau de Toilette"],
+    "Oriental/Amber":  ["Parfum", "Eau de Parfum", "Eau de Toilette"],
+    "Fresh/Aquatic":   ["Eau de Parfum", "Eau de Toilette", "Eau de Cologne"],
+    "Citrus":          ["Eau de Parfum", "Eau de Toilette", "Eau de Cologne"],
+    "Gourmand":        ["Parfum", "Eau de Parfum", "Eau de Toilette"],
+    "Aromatic":        ["Eau de Parfum", "Eau de Toilette", "Eau de Cologne"],
+    "Leather":         ["Parfum", "Eau de Parfum"],
+    "Musk":            ["Parfum", "Eau de Parfum", "Eau de Toilette"],
 }
+
+TAXONOMY: dict[str, dict[str, list[str]]] = {g: _FAMILY_CONCS for g in GENDERS}
+
+
+# ── Per-product helpers ───────────────────────────────────────────────────────
+
+def _sizes(p: Product) -> list[dict]:
+    return [s for s in (p.sizes or []) if isinstance(s, dict)]
+
+def _in_stock(p: Product) -> bool:
+    return any(s.get("stock", 0) > 0 for s in _sizes(p))
+
+def _min_price(p: Product) -> float:
+    prices = [float(p.sale_price)] if p.sale_price else [float(s["price"]) for s in _sizes(p) if "price" in s]
+    return min(prices) if prices else 0.0
+
+def _max_price(p: Product) -> float:
+    prices = [float(p.sale_price)] if p.sale_price else [float(s["price"]) for s in _sizes(p) if "price" in s]
+    return max(prices) if prices else 0.0
+
+def _all_notes(p: Product) -> list[str]:
+    return [
+        n.lower() for lst in [p.top_notes, p.heart_notes, p.base_notes]
+        for n in (lst or []) if isinstance(n, str)
+    ]
 
 
 def compute_facets(rows: list[Product]) -> dict:
-    sizes_c: Counter = Counter()
-    colors_c: Counter = Counter()
-    for p in rows:
-        if p.sizes:
-            for sz in p.sizes:
-                sizes_c[str(sz)] += 1
-        if p.colors:
-            for c in p.colors:
-                if isinstance(c, dict) and c.get("hex"):
-                    colors_c[c["hex"]] += 1
+    notes_c:  Counter = Counter()
+    sizes_c:  Counter = Counter()
+    seasons_c: Counter = Counter()
+    occasions_c: Counter = Counter()
 
-    prices = [float(p.sale_price or p.price) for p in rows]
+    for p in rows:
+        for n in _all_notes(p):
+            notes_c[n] += 1
+        for s in _sizes(p):
+            if s.get("stock", 0) > 0:
+                sizes_c[str(s["ml"])] += 1
+        for se in (p.season or []):
+            seasons_c[str(se)] += 1
+        for oc in (p.occasion or []):
+            occasions_c[str(oc)] += 1
+
+    prices = [_min_price(p) for p in rows if _sizes(p)]
     return {
-        "departments":  dict(Counter(p.department  for p in rows if p.department)),
-        "categories":   dict(Counter(p.category    for p in rows if p.category)),
-        "subcategories": dict(Counter(p.subcategory for p in rows if p.subcategory)),
-        "fits":         dict(Counter(p.fit         for p in rows if p.fit)),
-        "collections":  dict(Counter(p.collection  for p in rows if p.collection)),
-        "sizes":        dict(sizes_c),
-        "price_range":  {
+        "genders":        dict(Counter(p.gender      for p in rows if p.gender)),
+        "families":       dict(Counter(p.family      for p in rows if p.family)),
+        "concentrations": dict(Counter(p.concentration for p in rows if p.concentration)),
+        "collections":    dict(Counter(p.collection  for p in rows if p.collection)),
+        "notes":          dict(notes_c.most_common(30)),
+        "sizes":          dict(sizes_c),
+        "seasons":        dict(seasons_c),
+        "occasions":      dict(occasions_c),
+        "price_range": {
             "min": round(min(prices), 2) if prices else 0,
             "max": round(max(prices), 2) if prices else 0,
         },
     }
 
 
-# ── health ────────────────────────────────────────────────────────────────────
+# ── Health ────────────────────────────────────────────────────────────────────
+
 @app.get("/api/health")
 def health():
     return {"status": "ok"}
 
 
-# ── taxonomy ──────────────────────────────────────────────────────────────────
+# ── Taxonomy ──────────────────────────────────────────────────────────────────
+
 @app.get("/api/taxonomy")
 def get_taxonomy():
     return TAXONOMY
 
 
-# ── products ──────────────────────────────────────────────────────────────────
+# ── Products ──────────────────────────────────────────────────────────────────
+
 @app.get("/api/products")
 def list_products(
-    q:           str | None = None,
-    department:  str | None = None,
-    category:    str | None = None,
-    subcategory: str | None = None,
-    fit:         str | None = None,
-    collection:  str | None = None,
-    min_price:   float | None = None,
-    max_price:   float | None = None,
-    in_stock:    bool | None = None,
-    on_sale:     bool | None = None,
-    size:        str | None = None,   # filtered in Python (JSON array field)
-    color:       str | None = None,   # filtered in Python (JSON array field)
-    sort:        str = "newest",
-    page:        int = Query(1, ge=1),
-    page_size:   int = Query(20, ge=1, le=100),
+    q:            str | None = None,
+    gender:       str | None = None,
+    family:       str | None = None,
+    concentration: str | None = None,
+    collection:   str | None = None,
+    note:         str | None = None,          # search all three note lists
+    size_ml:      int | None = None,          # has this exact size available
+    season:       str | None = Query(None),
+    occasion:     str | None = Query(None),
+    min_price:    float | None = None,
+    max_price:    float | None = None,
+    in_stock:     bool | None = None,
+    on_sale:      bool | None = None,
+    sort:         str = "newest",
+    page:         int = Query(1, ge=1),
+    page_size:    int = Query(20, ge=1, le=100),
 ):
     with Session(engine) as s:
-        stmt = select(Product)
+        stmt = select(Product).where(Product.is_active == True)
 
+        # SQL-side filters (indexed columns)
         if q:
             stmt = stmt.where(
-                Product.name.ilike(f"%{q}%") | Product.description.ilike(f"%{q}%")
+                Product.name.ilike(f"%{q}%") |
+                Product.description.ilike(f"%{q}%") |
+                Product.brand.ilike(f"%{q}%")
             )
-        if department:
-            stmt = stmt.where(Product.department == department)
-        if category:
-            stmt = stmt.where(Product.category == category)
-        if subcategory:
-            stmt = stmt.where(Product.subcategory == subcategory)
-        if fit:
-            stmt = stmt.where(Product.fit == fit)
+        if gender:
+            stmt = stmt.where(Product.gender == gender)
+        if family:
+            stmt = stmt.where(Product.family == family)
+        if concentration:
+            stmt = stmt.where(Product.concentration == concentration)
         if collection:
             stmt = stmt.where(Product.collection == collection)
-        if min_price is not None:
-            stmt = stmt.where(Product.price >= min_price)
-        if max_price is not None:
-            stmt = stmt.where(Product.price <= max_price)
-        if in_stock:
-            stmt = stmt.where(Product.stock > 0)
         if on_sale:
             stmt = stmt.where(Product.sale_price.isnot(None))
 
         rows = list(s.exec(stmt).all())
 
-        # ── Python-side JSON-field filters ────────────────────────────────
-        if size:
-            rows = [p for p in rows if p.sizes and size in p.sizes]
-        if color:
-            cl = color.lower()
-            rows = [
-                p for p in rows
-                if p.colors and any(
-                    (isinstance(c, dict) and (
-                        c.get("hex", "").lower() == cl or
-                        c.get("name", "").lower() == cl
-                    ))
-                    for c in p.colors
-                )
-            ]
+    # Python-side filters on JSON fields
+    if note:
+        nl = note.lower()
+        rows = [p for p in rows if nl in _all_notes(p)]
+    if size_ml is not None:
+        rows = [p for p in rows if any(sz.get("ml") == size_ml for sz in _sizes(p))]
+    if season:
+        sl = season.lower()
+        rows = [p for p in rows if any(s_.lower() == sl for s_ in (p.season or []))]
+    if occasion:
+        ol = occasion.lower()
+        rows = [p for p in rows if any(o_.lower() == ol for o_ in (p.occasion or []))]
+    if in_stock:
+        rows = [p for p in rows if _in_stock(p)]
+    if min_price is not None:
+        rows = [p for p in rows if _max_price(p) >= min_price]
+    if max_price is not None:
+        rows = [p for p in rows if _min_price(p) <= max_price]
 
-        # ── Facets computed on full filtered set (before pagination) ──────
-        facets = compute_facets(rows)
+    # Facets computed on the full filtered set (before pagination)
+    facets = compute_facets(rows)
 
-        # ── Sort ──────────────────────────────────────────────────────────
-        if sort == "price_asc":
-            rows.sort(key=lambda p: float(p.sale_price or p.price))
-        elif sort == "price_desc":
-            rows.sort(key=lambda p: float(p.sale_price or p.price), reverse=True)
-        elif sort == "rating":
-            rows.sort(key=lambda p: p.rating, reverse=True)
-        elif sort == "popular":
-            rows.sort(key=lambda p: p.review_count, reverse=True)
-        else:
-            rows.sort(key=lambda p: p.id or 0, reverse=True)
+    # Sort
+    if sort == "price_asc":
+        rows.sort(key=_min_price)
+    elif sort == "price_desc":
+        rows.sort(key=_max_price, reverse=True)
+    elif sort == "rating":
+        rows.sort(key=lambda p: p.rating, reverse=True)
+    elif sort == "popular":
+        rows.sort(key=lambda p: p.review_count, reverse=True)
+    else:  # newest
+        rows.sort(key=lambda p: p.id or 0, reverse=True)
 
-        total = len(rows)
-        start = (page - 1) * page_size
-        return {
-            "items":  rows[start: start + page_size],
-            "total":  total,
-            "pages":  max(1, -(-total // page_size)),
-            "facets": facets,
-        }
-
-
-@app.get("/api/categories")
-def categories():
-    # Returns a flat sorted list of distinct categories (backward-compatible)
-    with Session(engine) as s:
-        return sorted({p.category for p in s.exec(select(Product)).all()})
+    total = len(rows)
+    start = (page - 1) * page_size
+    return {
+        "items":  rows[start: start + page_size],
+        "total":  total,
+        "pages":  max(1, -(-total // page_size)),
+        "facets": facets,
+    }
 
 
 def _get_product(s: Session, slug_or_id: str) -> Product:
@@ -227,15 +241,14 @@ def get_reviews(slug: str):
 class ReviewIn(BaseModel):
     author: str
     rating: int
-    title: str = ""
-    body: str = ""
+    title:  str = ""
+    body:   str = ""
 
 
 @app.post("/api/products/{slug}/reviews", status_code=201)
 def add_review(slug: str, data: ReviewIn):
     if not 1 <= data.rating <= 5:
         raise HTTPException(400, "Rating must be 1–5")
-    from datetime import date
     with Session(engine) as s:
         p = _get_product(s, slug)
         rv = Review(product_id=p.id, author=data.author, rating=data.rating,
@@ -247,7 +260,8 @@ def add_review(slug: str, data: ReviewIn):
         p.review_count = len(all_ratings)
         p.rating = round(sum(all_ratings) / len(all_ratings), 1)
         s.add(p)
-        s.commit(); s.refresh(rv)
+        s.commit()
+        s.refresh(rv)
         return rv
 
 
@@ -256,12 +270,17 @@ def related_products(slug: str):
     with Session(engine) as s:
         p = _get_product(s, slug)
         rows = s.exec(
-            select(Product).where(Product.category == p.category, Product.id != p.id)
+            select(Product).where(
+                Product.family == p.family,
+                Product.id != p.id,
+                Product.is_active == True,
+            )
         ).all()
         return rows[:8]
 
 
-# ── coupons ───────────────────────────────────────────────────────────────────
+# ── Coupons ───────────────────────────────────────────────────────────────────
+
 class CouponIn(BaseModel):
     code: str
 
@@ -277,26 +296,26 @@ def validate_coupon(data: CouponIn):
         return {"code": c.code, "percent": c.percent}
 
 
-# ── orders ────────────────────────────────────────────────────────────────────
+# ── Orders ────────────────────────────────────────────────────────────────────
+
 class CartItem(BaseModel):
     product_id: int
-    qty: int
-    size: str = ""
-    color: str = ""
+    qty:        int
+    size_ml:    int = 0   # chosen size in ml
 
 
 class OrderIn(BaseModel):
-    customer_name: str
-    customer_email: str
-    customer_phone: str = ""
+    customer_name:    str
+    customer_email:   str
+    customer_phone:   str = ""
     customer_address: str = ""
-    items: list[CartItem]
-    coupon_code: str = ""
-    payment_method: str = "cod"
+    items:            list[CartItem]
+    coupon_code:      str = ""
+    payment_method:   str = "cod"
 
 
-SHIPPING_USD = 1.5          # EGP ~75
-FREE_SHIPPING_USD = 50.0    # EGP ~2 500
+SHIPPING_USD      = 1.5
+FREE_SHIPPING_USD = 50.0
 
 
 @app.post("/api/orders", status_code=201)
@@ -312,38 +331,62 @@ def create_order(data: OrderIn):
             discount_pct = c.percent
 
         subtotal = 0.0
-        line_items: list[tuple[Product, CartItem]] = []
+        line_items: list[tuple[Product, CartItem, float]] = []
+
         for it in data.items:
             p = s.get(Product, it.product_id)
-            if not p or p.stock < it.qty:
-                raise HTTPException(400, f"Unavailable: {it.product_id}")
-            p.stock -= it.qty
-            subtotal += float(p.sale_price or p.price) * it.qty
+            if not p:
+                raise HTTPException(400, f"Product {it.product_id} not found")
+
+            # Find the chosen size in the product's sizes array
+            sizes = [sz for sz in (p.sizes or []) if isinstance(sz, dict)]
+            size_obj = next((sz for sz in sizes if sz.get("ml") == it.size_ml), None)
+            if size_obj is None:
+                raise HTTPException(400, f"Size {it.size_ml}ml not found for product {it.product_id}")
+            if size_obj.get("stock", 0) < it.qty:
+                raise HTTPException(400, f"Insufficient stock for {p.name} {it.size_ml}ml")
+
+            unit_price = float(p.sale_price if p.sale_price else size_obj["price"])
+            subtotal += unit_price * it.qty
+
+            # Decrement per-size stock (mutate the dict in the list)
+            size_obj["stock"] = size_obj["stock"] - it.qty
+            p.sizes = sizes  # re-assign to trigger SQLAlchemy dirty-tracking
             s.add(p)
-            line_items.append((p, it))
+            line_items.append((p, it, unit_price))
 
-        discount  = round(subtotal * discount_pct / 100, 2)
-        shipping  = 0.0 if subtotal >= FREE_SHIPPING_USD else SHIPPING_USD
-        total     = round(subtotal - discount + shipping, 2)
+        discount = round(subtotal * discount_pct / 100, 2)
+        shipping = 0.0 if subtotal >= FREE_SHIPPING_USD else SHIPPING_USD
+        total    = round(subtotal - discount + shipping, 2)
 
-        from datetime import datetime
         o = Order(
-            customer_name=data.customer_name, customer_email=data.customer_email,
-            customer_phone=data.customer_phone, customer_address=data.customer_address,
-            subtotal=round(subtotal, 2), shipping=shipping,
-            discount=discount, total=total,
+            customer_name=data.customer_name,
+            customer_email=data.customer_email,
+            customer_phone=data.customer_phone,
+            customer_address=data.customer_address,
+            subtotal=round(subtotal, 2),
+            shipping=shipping,
+            discount=discount,
+            total=total,
             coupon_code=data.coupon_code.upper() if data.coupon_code else "",
             payment_method=data.payment_method,
             created_at=datetime.now().isoformat(),
         )
-        s.add(o); s.flush()
-        for prod, it in line_items:
+        s.add(o)
+        s.flush()
+
+        for prod, it, unit_price in line_items:
             s.add(OrderItem(
-                order_id=o.id, product_id=prod.id,
-                product_name=prod.name, size=it.size, color=it.color,
-                qty=it.qty, price=float(prod.sale_price or prod.price),
+                order_id=o.id,
+                product_id=prod.id,
+                product_name=prod.name,
+                size_ml=it.size_ml,
+                qty=it.qty,
+                price=unit_price,
             ))
-        s.commit(); s.refresh(o)
+
+        s.commit()
+        s.refresh(o)
         return {"order_id": o.id, "total": o.total, "discount": o.discount}
 
 

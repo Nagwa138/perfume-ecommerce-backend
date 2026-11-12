@@ -15,7 +15,7 @@ from models import AdminUser, engine
 
 
 def main() -> None:
-    print("=== Nova Wear — Create Admin User ===")
+    print("=== AURA Perfume — Create Admin User ===")
     username = input("Username: ").strip()
     if not username:
         print("Username cannot be empty.")
