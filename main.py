@@ -16,16 +16,21 @@ with Session(engine) as _s:
     except Exception:
         pass
 
-app = FastAPI(title="Shop API")
+app = FastAPI(title="AURA Perfume API")
 
 from admin import router as admin_router
 app.include_router(admin_router)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://localhost:5174", "http://127.0.0.1:5173", "http://localhost:5175"],
+    allow_origins=[
+        "http://localhost:5174",
+        "http://127.0.0.1:5174",
+        "http://localhost:5173",   # clothing shop dev fallback
+        "http://localhost:5175",
+    ],
     allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-    allow_headers=["Content-Type", "Authorization", "x-admin-token"],
+    allow_headers=["Content-Type", "Authorization"],
 )
 
 # ── Taxonomy definition ───────────────────────────────────────────────────────
