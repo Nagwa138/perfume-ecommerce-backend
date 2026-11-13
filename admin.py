@@ -376,6 +376,32 @@ def chat_openai(messages: list[dict]) -> str:
 
 # ── Pydantic bodies ───────────────────────────────────────────────────────────
 
+class ProductCreateIn(BaseModel):
+    name:          str
+    brand:         str
+    product_type:  str = "perfume"
+    subcategory:   str = ""
+    gender:        str = "Unisex"
+    family:        str = ""
+    concentration: str = ""
+    description:   str = ""
+    collection:    str = ""
+    bottle_color:  str = "#C8A951"
+    cap_style:     str = "round"
+    longevity:     int = 5
+    sillage:       int = 5
+    top_notes:     list[str] = []
+    heart_notes:   list[str] = []
+    base_notes:    list[str] = []
+    season:        list[str] = []
+    occasion:      list[str] = []
+    skin_type:     list[str] = []
+    ingredients:   str = ""
+    how_to_use:    str = ""
+    sizes:         list[dict] = []
+    variants:      list[dict] = []
+
+
 class LoginIn(BaseModel):
     username: str
     password: str
@@ -438,6 +464,54 @@ def list_orders(payload: dict = Depends(require_role("staff"))):
         return result
 
 
+@router.get("/analytics")
+def analytics(payload: dict = Depends(require_role("staff"))):
+    from sqlalchemy import func
+    with Session(engine) as s:
+        orders  = s.exec(select(Order)).all()
+        items   = s.exec(select(OrderItem)).all()
+        # Join each item's product to get its type
+        product_types = {}
+        for it in items:
+            p = s.get(Product, it.product_id)
+            product_types[it.product_id] = (p.product_type if p else "unknown")
+
+        revenue_by_type: dict[str, float] = {}
+        units_by_type:   dict[str, int]   = {}
+        for it in items:
+            pt = product_types.get(it.product_id, "unknown")
+            # Only count items from non-cancelled orders
+            o = next((o for o in orders if o.id == it.order_id), None)
+            if o and o.status == "cancelled":
+                continue
+            revenue_by_type[pt] = round(revenue_by_type.get(pt, 0) + it.price * it.qty, 2)
+            units_by_type[pt]   = units_by_type.get(pt, 0) + it.qty
+
+        status_counts: dict[str, int] = {}
+        for o in orders:
+            status_counts[o.status] = status_counts.get(o.status, 0) + 1
+
+        # Top 5 products by units sold
+        unit_map: dict[int, int] = {}
+        for it in items:
+            unit_map[it.product_id] = unit_map.get(it.product_id, 0) + it.qty
+        top_ids = sorted(unit_map, key=lambda pid: unit_map[pid], reverse=True)[:5]
+        top_products = []
+        for pid in top_ids:
+            p = s.get(Product, pid)
+            if p:
+                top_products.append({"id": pid, "name": p.name, "product_type": p.product_type, "units": unit_map[pid]})
+
+    return {
+        "revenue_by_type":  revenue_by_type,
+        "units_by_type":    units_by_type,
+        "orders_by_status": status_counts,
+        "top_products":     top_products,
+        "total_revenue":    round(sum(o.total for o in orders if o.status != "cancelled"), 2),
+        "total_orders":     len(orders),
+    }
+
+
 @router.patch("/orders/{order_id}/status")
 def update_order_status(
     order_id: int, body: StatusIn,
@@ -454,6 +528,20 @@ def update_order_status(
         log_action(s, payload["sub"], "update_status", "order", order_id,
                    f"{old_status} → {body.status}")
     return {"ok": True}
+
+
+@router.post("/products", status_code=201)
+def create_product_direct(
+    body: ProductCreateIn,
+    payload: dict = Depends(require_role("staff")),
+):
+    result = run_tool("create_product", body.model_dump())
+    if "error" in result:
+        raise HTTPException(400, result["error"])
+    with Session(engine) as s:
+        log_action(s, payload["sub"], "create_product", "product",
+                   result.get("created_id"), result.get("slug", ""))
+    return result
 
 
 # ── Chat endpoint ─────────────────────────────────────────────────────────────
