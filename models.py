@@ -50,6 +50,19 @@ class Product(SQLModel, table=True):
     tags:       Optional[list] = Field(default=None, sa_column=Column(JSON))
     sale_price: Optional[float] = None
 
+    # ── Product-type classification ───────────────────────────────────────────
+    # perfume | skincare | makeup | haircare | body
+    product_type: str = Field(default="perfume", index=True)
+    subcategory:  str = ""   # Serum / Foundation / Shampoo / Body Cream / …
+
+    # ── Cosmetic fields (skincare / makeup / hair / body) ─────────────────────
+    # Makeup shade variants: [{name, shade_hex, stock}]
+    variants:    Optional[list] = Field(default=None, sa_column=Column(JSON))
+    # Applicable skin types: dry | oily | combination | sensitive | normal | all
+    skin_type:   Optional[list] = Field(default=None, sa_column=Column(JSON))
+    ingredients: str = ""    # key actives / INCI excerpt
+    how_to_use:  str = ""    # application instructions
+
     # ── Metrics ───────────────────────────────────────────────────────────────
     rating:       float = 0.0
     review_count: int   = 0

@@ -23,8 +23,9 @@ if not MOCK:
     client = anthropic.Anthropic(api_key=KEY)
 
 SYSTEM = (
-    "You are the AURA store admin assistant for a luxury perfume e-commerce shop. "
-    "Use the tools to read and modify the perfume catalog. Never invent data. "
+    "You are the AURA store admin assistant for a luxury beauty e-commerce shop "
+    "selling fragrance, skincare, makeup, haircare, and body products. "
+    "Use the tools to read and modify the product catalog. Never invent data. "
     "Before deleting a product, ask the admin to confirm; only pass confirmed=true after they explicitly say yes. "
     "Keep replies concise and professional."
 )
@@ -32,39 +33,50 @@ SYSTEM = (
 TOOLS = [
     {
         "name": "list_products",
-        "description": "List perfumes, filtered by gender, family, concentration or name. Returns up to 12 results.",
+        "description": "List beauty products, filtered by product_type, gender, family, concentration or name. Returns up to 12 results.",
         "input_schema": {
             "type": "object",
             "properties": {
+                "product_type":  {"type": "string", "description": "perfume | skincare | makeup | haircare | body"},
                 "gender":        {"type": "string", "description": "Women, Men or Unisex"},
-                "family":        {"type": "string", "description": "Floral, Woody, Oriental/Amber, etc."},
-                "concentration": {"type": "string", "description": "Parfum, Eau de Parfum, etc."},
+                "family":        {"type": "string", "description": "Floral, Woody, Oriental/Amber, etc. (fragrance only)"},
+                "concentration": {"type": "string", "description": "Parfum, Eau de Parfum, etc. (fragrance only)"},
                 "name_contains": {"type": "string"},
             },
         },
     },
     {
         "name": "create_product",
-        "description": "Create a new perfume product in the catalog.",
+        "description": "Create a new beauty product (fragrance, skincare, makeup, haircare, or body).",
         "input_schema": {
             "type": "object",
             "properties": {
                 "name":          {"type": "string"},
                 "brand":         {"type": "string"},
+                "product_type":  {"type": "string", "enum": ["perfume", "skincare", "makeup", "haircare", "body"], "description": "Category of beauty product"},
+                "subcategory":   {"type": "string", "description": "e.g. Serum, Foundation, Shampoo, Body Cream"},
                 "gender":        {"type": "string", "enum": ["Women", "Men", "Unisex"]},
-                "family":        {"type": "string"},
-                "concentration": {"type": "string"},
+                "family":        {"type": "string", "description": "Fragrance family (perfume only)"},
+                "concentration": {"type": "string", "description": "Fragrance concentration (perfume only)"},
                 "top_notes":     {"type": "array", "items": {"type": "string"}},
                 "heart_notes":   {"type": "array", "items": {"type": "string"}},
                 "base_notes":    {"type": "array", "items": {"type": "string"}},
                 "sizes":         {
                     "type": "array",
-                    "description": "List of {ml, price, stock} objects, e.g. [{\"ml\":50,\"price\":89,\"stock\":20}]",
+                    "description": "List of {ml, price, stock} objects",
                     "items": {"type": "object"},
                 },
+                "variants":      {
+                    "type": "array",
+                    "description": "Makeup shade variants: [{name, shade_hex, stock}]",
+                    "items": {"type": "object"},
+                },
+                "skin_type":     {"type": "array", "items": {"type": "string"}, "description": "dry|oily|combination|sensitive|normal|all"},
+                "ingredients":   {"type": "string", "description": "Key actives or INCI list"},
+                "how_to_use":    {"type": "string"},
                 "longevity":     {"type": "integer", "minimum": 1, "maximum": 10},
                 "sillage":       {"type": "integer", "minimum": 1, "maximum": 10},
-                "bottle_color":  {"type": "string", "description": "Hex colour for the liquid, e.g. #C8A951"},
+                "bottle_color":  {"type": "string", "description": "Hex colour for liquid (perfume only)"},
                 "cap_style":     {"type": "string", "enum": ["round", "square", "tall"]},
                 "description":   {"type": "string"},
                 "collection":    {"type": "string"},
@@ -74,7 +86,7 @@ TOOLS = [
                 "occasion":      {"type": "array", "items": {"type": "string"}},
                 "tags":          {"type": "array", "items": {"type": "string"}},
             },
-            "required": ["name", "brand", "family", "concentration"],
+            "required": ["name", "brand", "product_type"],
         },
     },
     {
@@ -159,6 +171,8 @@ def run_tool(name: str, a: dict):
         try:
             if name == "list_products":
                 q = select(Product).where(Product.is_active == True)
+                if a.get("product_type"):
+                    q = q.where(Product.product_type == a["product_type"])
                 if a.get("gender"):
                     q = q.where(Product.gender == a["gender"])
                 if a.get("family"):
@@ -171,6 +185,7 @@ def run_tool(name: str, a: dict):
                 return [
                     {
                         "id": p.id, "name": p.name, "brand": p.brand,
+                        "product_type": p.product_type, "subcategory": p.subcategory,
                         "gender": p.gender, "family": p.family,
                         "concentration": p.concentration,
                         "sizes": p.sizes,
@@ -181,31 +196,37 @@ def run_tool(name: str, a: dict):
 
             if name == "create_product":
                 slug_base = _slug_for(a["name"])
-                # Ensure slug uniqueness
                 slug = slug_base
                 n = 1
                 while s.exec(select(Product).where(Product.slug == slug)).first():
                     slug = f"{slug_base}-{n}"; n += 1
 
-                sizes = a.get("sizes") or [
-                    {"ml": 30,  "price": 65.0,  "stock": 20},
-                    {"ml": 50,  "price": 95.0,  "stock": 20},
-                    {"ml": 100, "price": 135.0, "stock": 20},
-                ]
-                img = f"https://loremflickr.com/600/760/perfume,bottle?lock={hash(slug) % 10000}"
+                ptype = a.get("product_type", "perfume")
+                kw = {"perfume": "perfume,bottle", "skincare": "skincare,serum",
+                      "makeup": "makeup,cosmetics", "haircare": "haircare",
+                      "body": "bodycare,lotion"}.get(ptype, "beauty")
+                img = f"https://loremflickr.com/600/760/{kw}?lock={hash(slug) % 10000}"
+
+                sizes = a.get("sizes") or [{"ml": 50, "price": 65.0, "stock": 20}]
                 p = Product(
                     slug=slug,
                     name=a["name"],
                     brand=a.get("brand", ""),
+                    product_type=ptype,
+                    subcategory=a.get("subcategory", ""),
                     gender=a.get("gender", "Unisex"),
-                    family=a["family"],
-                    concentration=a["concentration"],
+                    family=a.get("family", ""),
+                    concentration=a.get("concentration", ""),
                     top_notes=a.get("top_notes", []),
                     heart_notes=a.get("heart_notes", []),
                     base_notes=a.get("base_notes", []),
                     sizes=sizes,
-                    longevity=a.get("longevity", 6),
-                    sillage=a.get("sillage", 6),
+                    variants=a.get("variants"),
+                    skin_type=a.get("skin_type"),
+                    ingredients=a.get("ingredients", ""),
+                    how_to_use=a.get("how_to_use", ""),
+                    longevity=a.get("longevity", 5),
+                    sillage=a.get("sillage", 5),
                     bottle_color=a.get("bottle_color", "#C8A951"),
                     cap_style=a.get("cap_style", "round"),
                     description=a.get("description", ""),

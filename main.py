@@ -12,7 +12,7 @@ from auth import limiter
 
 SQLModel.metadata.create_all(engine)
 
-app = FastAPI(title="AURA Perfume API")
+app = FastAPI(title="AURA Beauty API")
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
@@ -81,10 +81,11 @@ def _all_notes(p: Product) -> list[str]:
 
 
 def compute_facets(rows: list[Product]) -> dict:
-    notes_c:  Counter = Counter()
-    sizes_c:  Counter = Counter()
-    seasons_c: Counter = Counter()
-    occasions_c: Counter = Counter()
+    notes_c:      Counter = Counter()
+    sizes_c:      Counter = Counter()
+    seasons_c:    Counter = Counter()
+    occasions_c:  Counter = Counter()
+    skin_type_c:  Counter = Counter()
 
     for p in rows:
         for n in _all_notes(p):
@@ -96,17 +97,22 @@ def compute_facets(rows: list[Product]) -> dict:
             seasons_c[str(se)] += 1
         for oc in (p.occasion or []):
             occasions_c[str(oc)] += 1
+        for st in (p.skin_type or []):
+            skin_type_c[str(st)] += 1
 
     prices = [_min_price(p) for p in rows if _sizes(p)]
     return {
-        "genders":        dict(Counter(p.gender      for p in rows if p.gender)),
-        "families":       dict(Counter(p.family      for p in rows if p.family)),
+        "product_types":  dict(Counter(p.product_type  for p in rows if p.product_type)),
+        "subcategories":  dict(Counter(p.subcategory   for p in rows if p.subcategory)),
+        "genders":        dict(Counter(p.gender        for p in rows if p.gender)),
+        "families":       dict(Counter(p.family        for p in rows if p.family)),
         "concentrations": dict(Counter(p.concentration for p in rows if p.concentration)),
-        "collections":    dict(Counter(p.collection  for p in rows if p.collection)),
+        "collections":    dict(Counter(p.collection    for p in rows if p.collection)),
         "notes":          dict(notes_c.most_common(30)),
         "sizes":          dict(sizes_c),
         "seasons":        dict(seasons_c),
         "occasions":      dict(occasions_c),
+        "skin_types":     dict(skin_type_c),
         "price_range": {
             "min": round(min(prices), 2) if prices else 0,
             "max": round(max(prices), 2) if prices else 0,
@@ -133,14 +139,17 @@ def get_taxonomy():
 @app.get("/api/products")
 def list_products(
     q:            str | None = None,
+    product_type: str | None = None,          # perfume | skincare | makeup | haircare | body
+    subcategory:  str | None = None,          # Serum / Foundation / …
     gender:       str | None = None,
     family:       str | None = None,
     concentration: str | None = None,
     collection:   str | None = None,
-    note:         str | None = None,          # search all three note lists
-    size_ml:      int | None = None,          # has this exact size available
+    note:         str | None = None,
+    size_ml:      int | None = None,
     season:       str | None = Query(None),
     occasion:     str | None = Query(None),
+    skin_type:    str | None = Query(None),
     min_price:    float | None = None,
     max_price:    float | None = None,
     in_stock:     bool | None = None,
@@ -159,6 +168,10 @@ def list_products(
                 Product.description.ilike(f"%{q}%") |
                 Product.brand.ilike(f"%{q}%")
             )
+        if product_type:
+            stmt = stmt.where(Product.product_type == product_type)
+        if subcategory:
+            stmt = stmt.where(Product.subcategory == subcategory)
         if gender:
             stmt = stmt.where(Product.gender == gender)
         if family:
@@ -184,6 +197,9 @@ def list_products(
     if occasion:
         ol = occasion.lower()
         rows = [p for p in rows if any(o_.lower() == ol for o_ in (p.occasion or []))]
+    if skin_type:
+        stl = skin_type.lower()
+        rows = [p for p in rows if any(st.lower() == stl for st in (p.skin_type or []))]
     if in_stock:
         rows = [p for p in rows if _in_stock(p)]
     if min_price is not None:
