@@ -12,7 +12,7 @@ import random
 from datetime import datetime, timedelta
 from sqlalchemy import text
 from sqlmodel import Session, SQLModel, select
-from models import engine, Product, Review, Order, OrderItem, Coupon
+from models import engine, Product, ProductVariant, Review, Order, OrderItem, Coupon
 
 SEED = 42
 rng = random.Random(SEED)
@@ -697,18 +697,18 @@ CATALOG = [
      "Riviera", 2022, "", False, False, 20),
 ]
 
-assert len(CATALOG) == 90, f"Expected 90 products, got {len(CATALOG)}"
+assert len(CATALOG) == 53, f"Expected 53 products, got {len(CATALOG)}"
 
 FEATURED_INDICES = {0, 1, 2, 3, 4, 5, 6, 7, 8, 10, 12, 13, 15, 17, 19, 21,
                     22, 25, 27, 29, 32, 35, 38, 40, 42, 44, 46, 48, 50, 52}
-SALE_INDICES     = {18, 24, 30, 42, 56}
+SALE_INDICES     = {18, 24, 30, 42, 50}
 
 
 # ── Drop & recreate tables ────────────────────────────────────────────────────
 print("\nDropping tables...")
 with engine.connect() as conn:
     conn.execute(text("PRAGMA foreign_keys = OFF"))
-    for tbl in ("order_item", "orders", "review", "product"):
+    for tbl in ("order_item", "orders", "review", "product_variant", "product"):
         conn.execute(text(f"DROP TABLE IF EXISTS {tbl}"))
     conn.execute(text("PRAGMA foreign_keys = ON"))
     conn.commit()
@@ -776,6 +776,33 @@ with Session(engine) as session:
 print(f"  {len(products)} products inserted.")
 
 
+# ── ProductVariant rows (makeup shade relational table) ───────────────────────
+print("Seeding makeup shade variants...")
+variant_total = 0
+
+with Session(engine) as session:
+    for p in products:
+        if not p.variants:
+            continue
+        sizes_list = [s for s in (p.sizes or []) if isinstance(s, dict)]
+        base_price = float(sizes_list[0]["price"]) if sizes_list else 0.0
+        for shade in p.variants:
+            if not isinstance(shade, dict):
+                continue
+            session.add(ProductVariant(
+                product_id=p.id,
+                kind="shade",
+                label=shade.get("name", ""),
+                shade_hex=shade.get("shade_hex", "#CCCCCC"),
+                price=base_price,
+                stock=shade.get("stock", 0),
+            ))
+            variant_total += 1
+    session.commit()
+
+print(f"  {variant_total} shade variants inserted.")
+
+
 # ── Reviews ───────────────────────────────────────────────────────────────────
 print("Seeding reviews (5-8 per product)...")
 review_total = 0
@@ -838,8 +865,10 @@ with Session(engine) as session:
         cust     = rng.choice(CUSTOMERS)
         name, email, phone, address = cust
 
-        n_items = rng.randint(1, 3)
-        chosen  = rng.sample(products, n_items)
+        n_items    = rng.randint(1, 3)
+        chosen_ids = [p.id for p in rng.sample(products, n_items)]
+        chosen     = [session.get(Product, pid) for pid in chosen_ids]
+        chosen     = [p for p in chosen if p]
 
         coupon_code, discount_pct = "", 0
         if rng.random() < 0.25:
