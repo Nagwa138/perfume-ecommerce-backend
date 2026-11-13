@@ -7,7 +7,7 @@ from sqlmodel import SQLModel, Session, select
 from slowapi import _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 
-from models import engine, Product, Review, Order, OrderItem, Coupon
+from models import engine, Product, ProductVariant, Review, Order, OrderItem, Coupon
 from auth import limiter
 
 SQLModel.metadata.create_all(engine)
@@ -285,6 +285,13 @@ def add_review(slug: str, data: ReviewIn):
         return rv
 
 
+@app.get("/api/products/{slug}/variants")
+def get_product_variants(slug: str):
+    with Session(engine) as s:
+        p = _get_product(s, slug)
+        return s.exec(select(ProductVariant).where(ProductVariant.product_id == p.id)).all()
+
+
 @app.get("/api/products/{slug}/related")
 def related_products(slug: str):
     with Session(engine) as s:
@@ -321,7 +328,8 @@ def validate_coupon(data: CouponIn):
 class CartItem(BaseModel):
     product_id: int
     qty:        int
-    size_ml:    int = 0   # chosen size in ml
+    size_ml:    int = 0           # chosen size in ml (0 for makeup shade variants)
+    variant_id: int | None = None # ProductVariant.id for makeup shade orders
 
 
 class OrderIn(BaseModel):
@@ -358,21 +366,30 @@ def create_order(data: OrderIn):
             if not p:
                 raise HTTPException(400, f"Product {it.product_id} not found")
 
-            # Find the chosen size in the product's sizes array
-            sizes = [sz for sz in (p.sizes or []) if isinstance(sz, dict)]
-            size_obj = next((sz for sz in sizes if sz.get("ml") == it.size_ml), None)
-            if size_obj is None:
-                raise HTTPException(400, f"Size {it.size_ml}ml not found for product {it.product_id}")
-            if size_obj.get("stock", 0) < it.qty:
-                raise HTTPException(400, f"Insufficient stock for {p.name} {it.size_ml}ml")
+            if it.variant_id is not None:
+                # Shade-variant path (makeup, nail polish, etc.)
+                variant = s.get(ProductVariant, it.variant_id)
+                if not variant or variant.product_id != it.product_id:
+                    raise HTTPException(400, f"Variant {it.variant_id} not found for product {it.product_id}")
+                if variant.stock < it.qty:
+                    raise HTTPException(400, f"Insufficient stock for shade '{variant.label}'")
+                unit_price = float(p.sale_price if p.sale_price else variant.price)
+                variant.stock -= it.qty
+                s.add(variant)
+            else:
+                # Size-based path (perfume ml, body sizes, etc.)
+                sizes = [sz for sz in (p.sizes or []) if isinstance(sz, dict)]
+                size_obj = next((sz for sz in sizes if sz.get("ml") == it.size_ml), None)
+                if size_obj is None:
+                    raise HTTPException(400, f"Size {it.size_ml}ml not found for product {it.product_id}")
+                if size_obj.get("stock", 0) < it.qty:
+                    raise HTTPException(400, f"Insufficient stock for {p.name} {it.size_ml}ml")
+                unit_price = float(p.sale_price if p.sale_price else size_obj["price"])
+                size_obj["stock"] = size_obj["stock"] - it.qty
+                p.sizes = sizes  # re-assign to trigger SQLAlchemy dirty-tracking
+                s.add(p)
 
-            unit_price = float(p.sale_price if p.sale_price else size_obj["price"])
             subtotal += unit_price * it.qty
-
-            # Decrement per-size stock (mutate the dict in the list)
-            size_obj["stock"] = size_obj["stock"] - it.qty
-            p.sizes = sizes  # re-assign to trigger SQLAlchemy dirty-tracking
-            s.add(p)
             line_items.append((p, it, unit_price))
 
         discount = round(subtotal * discount_pct / 100, 2)

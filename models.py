@@ -109,6 +109,20 @@ class OrderItem(SQLModel, table=True):
     price:        float = 0.0      # price at time of order
 
 
+class ProductVariant(SQLModel, table=True):
+    __tablename__ = "product_variant"
+    id:         Optional[int] = Field(default=None, primary_key=True)
+    product_id: int = Field(foreign_key="product.id", index=True)
+    kind:       str = "shade"      # shade | size | bundle
+    label:      str = ""           # e.g. "Rose Petal"
+    shade_hex:  str = ""           # #RRGGBB for makeup swatches
+    undertone:  str = ""           # warm | cool | neutral
+    price:      float = 0.0
+    stock:      int = 0
+    sku:        str = ""
+    image:      str = ""
+
+
 class Coupon(SQLModel, table=True):
     id:      Optional[int] = Field(default=None, primary_key=True)
     code:    str = Field(unique=True, index=True)
