@@ -721,7 +721,7 @@ print("Tables recreated.")
 print("Seeding 90 products...")
 products: list[Product] = []
 
-with Session(engine) as session:
+with Session(engine, expire_on_commit=False) as session:
     for idx, row in enumerate(CATALOG):
         (name, brand, ptype, subcat, gender,
          family, concentration,
@@ -774,6 +774,7 @@ with Session(engine) as session:
         session.refresh(p)
 
 print(f"  {len(products)} products inserted.")
+product_ids = [p.id for p in products]
 
 
 # ── ProductVariant rows (makeup shade relational table) ───────────────────────
@@ -866,7 +867,7 @@ with Session(engine) as session:
         name, email, phone, address = cust
 
         n_items    = rng.randint(1, 3)
-        chosen_ids = [p.id for p in rng.sample(products, n_items)]
+        chosen_ids = rng.sample(product_ids, n_items)
         chosen     = [session.get(Product, pid) for pid in chosen_ids]
         chosen     = [p for p in chosen if p]
 

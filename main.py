@@ -285,6 +285,31 @@ def add_review(slug: str, data: ReviewIn):
         return rv
 
 
+@app.get("/api/reviews/top")
+def get_top_reviews(limit: int = 9):
+    with Session(engine) as s:
+        reviews = s.exec(
+            select(Review, Product.name, Product.slug)
+            .join(Product, Review.product_id == Product.id)
+            .where(Review.rating >= 4)
+            .where(Review.body != "")
+            .order_by(Review.id.desc())
+            .limit(limit * 10)
+        ).all()
+        long_reviews = [r for r in reviews if len(r[0].body) >= 40]
+        seen_products: set[int] = set()
+        diverse: list = []
+        for rv, pname, pslug in long_reviews:
+            if rv.product_id not in seen_products:
+                diverse.append({"id": rv.id, "author": rv.author, "rating": rv.rating,
+                                "title": rv.title, "body": rv.body, "date": rv.date,
+                                "product_name": pname, "product_slug": pslug})
+                seen_products.add(rv.product_id)
+            if len(diverse) >= limit:
+                break
+        return diverse
+
+
 @app.get("/api/products/{slug}/variants")
 def get_product_variants(slug: str):
     with Session(engine) as s:
